@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: keikomik-mirror
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: ORIGIN_HOST
+        value: keikomik.web.id
+      - key: ORIGIN_PROTOCOL
+        value: https
+      - key: MIRROR_HOST
+        sync: false
+      - key: MIRROR_PROTOCOL
+        value: https
+      - key: NODE_ENV
+        value: production

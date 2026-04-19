@@ -1,0 +1,19 @@
+{
+  "name": "keikomik-mirror",
+  "version": "1.0.0",
+  "description": "Full mirror proxy for keikomik.web.id with SEO optimization",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "http-proxy-middleware": "^3.0.3",
+    "cheerio": "^1.0.0",
+    "compression": "^1.7.4"
+  }
+}
