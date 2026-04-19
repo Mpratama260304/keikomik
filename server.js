@@ -751,7 +751,15 @@ function rewriteHtml(html, mirrorBase) {
     } catch (e) { /* ignore parse errors */ }
   });
 
-  // 18. Inject AGGRESSIVE client-side ad blocker with MutationObserver
+  // 18. Auto-update footer copyright year
+  $('footer').find('p').each(function () {
+    const text = $(this).html();
+    if (text && text.match(/©\s*\d{4}/)) {
+      $(this).html(text.replace(/©\s*\d{4}/, `© ${new Date().getFullYear()}`));
+    }
+  });
+
+  // 19. Inject AGGRESSIVE client-side ad blocker with MutationObserver
   $('head').prepend(`<script>
     // === KEIKOMIK MIRROR AD BLOCKER ===
     (function() {
