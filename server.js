@@ -313,6 +313,11 @@ function stripAdsFromJs(jsContent) {
   // Neutralize hil-banner ID patterns
   result = result.replace(/hil-banner[A-Za-z0-9]*/g, 'blocked-banner');
   result = result.replace(/hil_banner[A-Za-z0-9]*/g, 'blocked-banner');
+  // Auto-update copyright year in JS bundles (Next.js hydration)
+  const currentYear = new Date().getFullYear().toString();
+  result = result.replace(/©\s*2025/g, `© ${currentYear}`);
+  result = result.replace(/\\u00a9\s*2025/g, `\\u00a9 ${currentYear}`);
+  result = result.replace(/&#169;\s*2025/g, `&#169; ${currentYear}`);
   return result;
 }
 
@@ -898,6 +903,25 @@ function rewriteHtml(html, mirrorBase) {
       Object.defineProperty(document.body || document.documentElement, 'onclick', {
         set: function() {},
         get: function() { return null; }
+      });
+      // Auto-fix copyright year after Next.js hydration
+      function fixYear() {
+        var y = new Date().getFullYear();
+        document.querySelectorAll('footer p').forEach(function(p) {
+          if (p.textContent.match(/©\s*\d{4}/)) {
+            p.textContent = p.textContent.replace(/©\s*\d{4}/, '© ' + y);
+          }
+        });
+      }
+      fixYear();
+      window.addEventListener('load', function() { fixYear(); setTimeout(fixYear, 500); setTimeout(fixYear, 2000); });
+      var yearObs = new MutationObserver(function() { fixYear(); });
+      var ft = document.querySelector('footer');
+      if (ft) yearObs.observe(ft, { childList: true, subtree: true, characterData: true });
+      else document.addEventListener('DOMContentLoaded', function() {
+        ft = document.querySelector('footer');
+        if (ft) yearObs.observe(ft, { childList: true, subtree: true, characterData: true });
+        fixYear();
       });
     })();
   </script>`);
