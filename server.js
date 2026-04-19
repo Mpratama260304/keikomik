@@ -28,6 +28,53 @@ const PORT = parseInt(process.env.PORT, 10) || 3000;
 const MIRROR_HOST = process.env.MIRROR_HOST || "";
 const MIRROR_PROTOCOL = process.env.MIRROR_PROTOCOL || "https";
 
+// ─── PERFORMANCE: Keep-Alive agents for connection pooling ─────────────────────
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 30000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 30000 });
+
+// ─── PERFORMANCE: In-memory cache ─────────────────────────────────────────────
+// Cache processed responses to avoid re-fetching & re-processing from origin.
+// Static assets (JS, CSS, images, fonts) are cached longer; HTML pages shorter.
+const responseCache = new Map();
+const CACHE_MAX_ITEMS = 500;
+const CACHE_TTL_STATIC = 30 * 60 * 1000;  // 30 min for JS/CSS/images/fonts
+const CACHE_TTL_HTML = 60 * 1000;          // 60 sec for HTML pages
+const CACHE_TTL_JSON = 30 * 1000;          // 30 sec for JSON API data
+
+function getCacheTTL(contentType, path) {
+  // Next.js static chunks — very long cache (content-hashed filenames)
+  if (path.startsWith("/_next/static/")) return CACHE_TTL_STATIC;
+  // Images/fonts — long cache
+  if (contentType.match(/image\/|font\/|application\/font|woff|woff2/)) return CACHE_TTL_STATIC;
+  // CSS/JS
+  if (contentType.includes("css") || contentType.includes("javascript")) return CACHE_TTL_STATIC;
+  // HTML pages
+  if (contentType.includes("html") || contentType.includes("xhtml")) return CACHE_TTL_HTML;
+  // JSON data (Next.js data routes)
+  if (contentType.includes("json")) return CACHE_TTL_JSON;
+  // Everything else
+  return CACHE_TTL_HTML;
+}
+
+function cacheGet(key) {
+  const entry = responseCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiry) {
+    responseCache.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function cacheSet(key, data, ttl) {
+  // Evict oldest entries if cache is full
+  if (responseCache.size >= CACHE_MAX_ITEMS) {
+    const firstKey = responseCache.keys().next().value;
+    responseCache.delete(firstKey);
+  }
+  responseCache.set(key, { ...data, expiry: Date.now() + ttl });
+}
+
 // ─── VERCEL FIREWALL BYPASS ────────────────────────────────────────────────────
 // Solves Vercel's proof-of-work challenge server-side so users never see it.
 // Caches the bypass cookie and auto-refreshes when expired.
@@ -367,6 +414,7 @@ function fetchFromOriginRaw(path, method, reqHeaders, reqBody, extraCookie) {
       method: method,
       headers: headers,
       timeout: 30000,
+      agent: parsed.protocol === "https:" ? httpsAgent : httpAgent,
     };
 
     const transport = parsed.protocol === "https:" ? https : http;
@@ -414,28 +462,31 @@ function fetchFromOriginRaw(path, method, reqHeaders, reqBody, extraCookie) {
 
 /**
  * Fetch from origin with automatic Vercel firewall bypass.
- * If origin returns a challenge page, solve it, get cookie, and retry.
+ * Only checks for challenge on HTML-like responses (not binaries/static assets).
  */
 async function fetchFromOrigin(path, method, reqHeaders, reqBody) {
   // First try with cached bypass cookie
   const cookie = getVercelCookie();
   let result = await fetchFromOriginRaw(path, method, reqHeaders, reqBody, cookie);
 
-  // Check if response is a Vercel challenge page
-  const bodyStr = result.body.toString("utf-8");
-  const challengeToken = detectVercelChallenge(bodyStr);
+  // Only check for Vercel challenge on non-static, HTML-like responses
+  // Static assets (JS, CSS, images, fonts) never return challenge pages
+  const ct = result.headers["content-type"] || "";
+  const isHtmlLike = ct.includes("text/html") || ct.includes("xhtml") || result.status === 403;
 
-  if (challengeToken) {
-    // Solve the challenge and get a new bypass cookie
-    try {
-      const newCookie = await obtainVercelBypass(challengeToken);
-      if (newCookie) {
-        // Retry the original request with the new cookie
-        result = await fetchFromOriginRaw(path, method, reqHeaders, reqBody, newCookie);
+  if (isHtmlLike) {
+    const bodyStr = result.body.toString("utf-8");
+    const challengeToken = detectVercelChallenge(bodyStr);
+
+    if (challengeToken) {
+      try {
+        const newCookie = await obtainVercelBypass(challengeToken);
+        if (newCookie) {
+          result = await fetchFromOriginRaw(path, method, reqHeaders, reqBody, newCookie);
+        }
+      } catch (err) {
+        console.error("[VERCEL] Failed to solve challenge:", err.message);
       }
-    } catch (err) {
-      console.error("[VERCEL] Failed to solve challenge:", err.message);
-      // Return the original challenge response as fallback
     }
   }
 
@@ -886,14 +937,14 @@ function generateRobotsTxt(originalRobots, mirrorBase) {
 const app = express();
 
 // Enable gzip compression for responses
-app.use(compression());
+app.use(compression({ level: 6 }));
 
 // Trust proxy (for Railway, Render, etc.)
 app.set("trust proxy", true);
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "ok", origin: ORIGIN_HOST });
+  res.status(200).json({ status: "ok", origin: ORIGIN_HOST, cached: responseCache.size });
 });
 
 // ─── MAIN PROXY HANDLER ────────────────────────────────────────────────────────
@@ -903,10 +954,23 @@ app.all("*", async (req, res) => {
     const requestPath = req.originalUrl;
 
     // ─── BLOCK AD DOMAIN REQUESTS ────────────────────────────────────
-    // If the request path somehow routes to an ad, or referer is ad, block it
-    const fullUrl = `${mirrorBase}${requestPath}`;
     if (BLOCKED_AD_DOMAINS.some(d => requestPath.includes(d))) {
       return res.status(204).end();
+    }
+
+    // ─── CHECK CACHE ─────────────────────────────────────────────────
+    // Only cache GET requests
+    const cacheKey = requestPath;
+    if (req.method === "GET") {
+      const cached = cacheGet(cacheKey);
+      if (cached) {
+        // Serve from cache
+        for (const [k, v] of Object.entries(cached.resHeaders)) {
+          res.set(k, v);
+        }
+        res.set("X-Cache", "HIT");
+        return res.status(cached.status).send(cached.body);
+      }
     }
 
     // Collect request body for POST/PUT/PATCH
@@ -1009,8 +1073,6 @@ app.all("*", async (req, res) => {
     );
 
     // ─── HANDLE 404 ────────────────────────────────────────────────────
-    // Return the actual origin status; don't mask errors
-    // But if origin returns 404, serve it properly so Google de-indexes cleanly
     if (origin.status === 404) {
       if (isHtmlContent(contentType)) {
         let html = origin.body.toString("utf-8");
@@ -1022,12 +1084,47 @@ app.all("*", async (req, res) => {
       return res.status(404).send(origin.body);
     }
 
+    // ─── Helper: send + cache a processed response ────────────────────
+    function sendAndCache(status, ct, body, ttl) {
+      const resHeaders = {};
+      // Collect current response headers for caching
+      const raw = res.getHeaders();
+      for (const [k, v] of Object.entries(raw)) {
+        resHeaders[k] = v;
+      }
+      resHeaders["content-type"] = ct;
+      res.set("Content-Type", ct);
+      res.set("X-Cache", "MISS");
+
+      // Cache for browser
+      if (requestPath.startsWith("/_next/static/")) {
+        res.set("Cache-Control", "public, max-age=31536000, immutable");
+      } else if (ct.includes("html")) {
+        res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
+      } else if (ct.match(/image\/|font\/|woff/)) {
+        res.set("Cache-Control", "public, max-age=86400");
+      } else if (ct.includes("javascript") || ct.includes("css")) {
+        res.set("Cache-Control", "public, max-age=3600");
+      }
+
+      // Update headers for cache entry
+      const finalHeaders = res.getHeaders();
+      for (const [k, v] of Object.entries(finalHeaders)) {
+        resHeaders[k] = v;
+      }
+
+      // Store in server-side cache (only GET, only 200)
+      if (req.method === "GET" && status === 200) {
+        cacheSet(cacheKey, { status, resHeaders, body: Buffer.isBuffer(body) ? body : Buffer.from(body) }, ttl);
+      }
+
+      return res.status(status).send(body);
+    }
+
     // ─── ROBOTS.TXT ────────────────────────────────────────────────────
     if (requestPath === "/robots.txt") {
       const robotsTxt = generateRobotsTxt(origin.body.toString("utf-8"), mirrorBase);
-      res.set("Content-Type", "text/plain; charset=utf-8");
-      res.set("Cache-Control", "public, max-age=3600");
-      return res.status(200).send(robotsTxt);
+      return sendAndCache(200, "text/plain; charset=utf-8", robotsTxt, 3600 * 1000);
     }
 
     // ─── SITEMAP HANDLING ──────────────────────────────────────────────
@@ -1037,9 +1134,7 @@ app.all("*", async (req, res) => {
     ) {
       let xmlContent = origin.body.toString("utf-8");
       xmlContent = rewriteXml(xmlContent, mirrorBase);
-      res.set("Content-Type", "application/xml; charset=utf-8");
-      res.set("Cache-Control", "public, max-age=3600");
-      return res.status(origin.status).send(xmlContent);
+      return sendAndCache(origin.status, "application/xml; charset=utf-8", xmlContent, 3600 * 1000);
     }
 
     // ─── HTML CONTENT ──────────────────────────────────────────────────
@@ -1047,8 +1142,7 @@ app.all("*", async (req, res) => {
       let html = origin.body.toString("utf-8");
       html = rewriteHtml(html, mirrorBase);
       html = ensureCanonical(html, mirrorBase, requestPath);
-      res.set("Content-Type", contentType);
-      return res.status(origin.status).send(html);
+      return sendAndCache(origin.status, contentType, html, CACHE_TTL_HTML);
     }
 
     // ─── JAVASCRIPT CONTENT — strip ad code ──────────────────────────
@@ -1056,21 +1150,18 @@ app.all("*", async (req, res) => {
       let jsText = origin.body.toString("utf-8");
       jsText = rewriteUrls(jsText, mirrorBase);
       jsText = stripAdsFromJs(jsText);
-      res.set("Content-Type", contentType);
-      return res.status(origin.status).send(jsText);
+      return sendAndCache(origin.status, contentType, jsText, CACHE_TTL_STATIC);
     }
 
     // ─── OTHER TEXT CONTENT (CSS, XML, JSON, SVG) ──────────────────────
     if (isTextContent(contentType)) {
       let text = origin.body.toString("utf-8");
       text = rewriteUrls(text, mirrorBase);
-      res.set("Content-Type", contentType);
-      return res.status(origin.status).send(text);
+      return sendAndCache(origin.status, contentType, text, getCacheTTL(contentType, requestPath));
     }
 
     // ─── BINARY CONTENT (images, fonts, etc.) ──────────────────────────
-    // Pass through without modification
-    return res.status(origin.status).send(origin.body);
+    return sendAndCache(origin.status, contentType, origin.body, CACHE_TTL_STATIC);
 
   } catch (err) {
     console.error("[PROXY ERROR]", err.message);
