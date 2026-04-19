@@ -16,6 +16,7 @@ const http = require("http");
 const https = require("https");
 const { URL } = require("url");
 const zlib = require("zlib");
+const crypto = require("crypto");
 const compression = require("compression");
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────────
@@ -26,6 +27,142 @@ const PORT = parseInt(process.env.PORT, 10) || 3000;
 // Mirror domain — set this to your actual mirror domain
 const MIRROR_HOST = process.env.MIRROR_HOST || "";
 const MIRROR_PROTOCOL = process.env.MIRROR_PROTOCOL || "https";
+
+// ─── VERCEL FIREWALL BYPASS ────────────────────────────────────────────────────
+// Solves Vercel's proof-of-work challenge server-side so users never see it.
+// Caches the bypass cookie and auto-refreshes when expired.
+
+let vercelBypassCookie = "";
+let vercelCookieExpiry = 0;
+
+/**
+ * SHA-256 hash of a string, returned as hex.
+ */
+async function sha256(str) {
+  const hash = crypto.createHash("sha256").update(str).digest("hex");
+  return hash;
+}
+
+/**
+ * Find a random key such that sha256(prefix + key) starts with requiredPrefix.
+ */
+async function findMatchingKey(prefix, requiredPrefix) {
+  while (true) {
+    const key = Math.random().toString(36).substring(2, 15);
+    const hash = await sha256(prefix + key);
+    if (hash.startsWith(requiredPrefix)) {
+      return { key, hash };
+    }
+  }
+}
+
+/**
+ * Solve a Vercel challenge token (proof-of-work).
+ */
+async function solveVercelChallenge(challengeToken) {
+  const parts = challengeToken.split(".");
+  const decodedToken = Buffer.from(parts[3], "base64").toString("utf-8");
+  const [prefix, suffix, startHash, iterations] = decodedToken.split(";");
+  let currentHash = startHash;
+  const keys = [];
+
+  for (let i = 0; i < Number(iterations); i++) {
+    const { key, hash } = await findMatchingKey(suffix, currentHash);
+    keys.push(key);
+    currentHash = hash.slice(-currentHash.length);
+  }
+
+  return keys.join(";");
+}
+
+/**
+ * Submit the solved challenge to Vercel and get the bypass cookie.
+ */
+function submitVercelSolution(challengeToken, solution) {
+  return new Promise((resolve, reject) => {
+    const url = `${ORIGIN_BASE}/.well-known/vercel/security/request-challenge`;
+    const parsed = new URL(url);
+
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port,
+      path: parsed.pathname,
+      method: "POST",
+      headers: {
+        host: ORIGIN_HOST,
+        "x-vercel-challenge-token": challengeToken,
+        "x-vercel-challenge-solution": solution,
+        "content-length": "0",
+      },
+      timeout: 30000,
+    };
+
+    const transport = parsed.protocol === "https:" ? https : http;
+    const req = transport.request(options, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        // Extract set-cookie headers
+        const setCookies = res.headers["set-cookie"] || [];
+        resolve({ status: res.statusCode, setCookies, headers: res.headers });
+      });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("Vercel challenge submit timed out")); });
+    req.end();
+  });
+}
+
+/**
+ * Detect if a response body is a Vercel firewall challenge page.
+ * Returns the challenge token if found, null otherwise.
+ */
+function detectVercelChallenge(bodyStr) {
+  if (!bodyStr.includes("_vcrct")) return null;
+  const match = bodyStr.match(/window\._vcrct="([^"]+)"/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Parse Set-Cookie headers and extract cookie name=value pairs.
+ */
+function parseCookies(setCookieHeaders) {
+  return setCookieHeaders.map(c => c.split(";")[0]).join("; ");
+}
+
+/**
+ * Solve the Vercel challenge and cache the bypass cookie.
+ * Returns the cookie string to use in subsequent requests.
+ */
+async function obtainVercelBypass(challengeToken) {
+  console.log("[VERCEL] Solving firewall challenge...");
+  const solution = await solveVercelChallenge(challengeToken);
+  console.log("[VERCEL] Challenge solved, submitting...");
+  const result = await submitVercelSolution(challengeToken, solution);
+  console.log("[VERCEL] Submit status:", result.status);
+
+  if (result.status === 204 || result.status === 200) {
+    const cookie = parseCookies(result.setCookies);
+    vercelBypassCookie = cookie;
+    // Cache for 55 minutes (Vercel cookies typically last ~1 hour)
+    vercelCookieExpiry = Date.now() + 55 * 60 * 1000;
+    console.log("[VERCEL] Bypass cookie obtained:", cookie ? "yes" : "empty");
+    return cookie;
+  } else {
+    console.error("[VERCEL] Challenge submission failed:", result.status);
+    return "";
+  }
+}
+
+/**
+ * Get cached bypass cookie if still valid.
+ */
+function getVercelCookie() {
+  if (vercelBypassCookie && Date.now() < vercelCookieExpiry) {
+    return vercelBypassCookie;
+  }
+  return "";
+}
 
 // ─── AD BLOCKING CONFIG ────────────────────────────────────────────────────────
 // Domains known to serve ads, tracking pixels, and redirect hijackers
@@ -200,9 +337,10 @@ function rewriteUrls(text, mirrorBase) {
 }
 
 /**
- * Fetch a resource from origin. Returns { status, headers, body (Buffer) }.
+ * Raw fetch from origin. Returns { status, headers, body (Buffer) }.
+ * Includes bypass cookie if provided.
  */
-function fetchFromOrigin(path, method, reqHeaders, reqBody) {
+function fetchFromOriginRaw(path, method, reqHeaders, reqBody, extraCookie) {
   return new Promise((resolve, reject) => {
     const originUrl = `${ORIGIN_BASE}${path}`;
     const parsed = new URL(originUrl);
@@ -215,6 +353,12 @@ function fetchFromOrigin(path, method, reqHeaders, reqBody) {
     // Remove if-modified-since / if-none-match to always get fresh content for rewriting
     delete headers["if-modified-since"];
     delete headers["if-none-match"];
+
+    // Inject Vercel bypass cookie
+    if (extraCookie) {
+      const existing = headers["cookie"] || "";
+      headers["cookie"] = existing ? `${existing}; ${extraCookie}` : extraCookie;
+    }
 
     const options = {
       hostname: parsed.hostname,
@@ -266,6 +410,36 @@ function fetchFromOrigin(path, method, reqHeaders, reqBody) {
     }
     proxyReq.end();
   });
+}
+
+/**
+ * Fetch from origin with automatic Vercel firewall bypass.
+ * If origin returns a challenge page, solve it, get cookie, and retry.
+ */
+async function fetchFromOrigin(path, method, reqHeaders, reqBody) {
+  // First try with cached bypass cookie
+  const cookie = getVercelCookie();
+  let result = await fetchFromOriginRaw(path, method, reqHeaders, reqBody, cookie);
+
+  // Check if response is a Vercel challenge page
+  const bodyStr = result.body.toString("utf-8");
+  const challengeToken = detectVercelChallenge(bodyStr);
+
+  if (challengeToken) {
+    // Solve the challenge and get a new bypass cookie
+    try {
+      const newCookie = await obtainVercelBypass(challengeToken);
+      if (newCookie) {
+        // Retry the original request with the new cookie
+        result = await fetchFromOriginRaw(path, method, reqHeaders, reqBody, newCookie);
+      }
+    } catch (err) {
+      console.error("[VERCEL] Failed to solve challenge:", err.message);
+      // Return the original challenge response as fallback
+    }
+  }
+
+  return result;
 }
 
 /**
@@ -805,6 +979,9 @@ app.all("*", async (req, res) => {
       "server",
       "x-powered-by",
       "strict-transport-security",
+      "set-cookie",           // Don't leak Vercel/origin cookies to user
+      "x-vercel-id",
+      "x-vercel-cache",
     ]);
 
     for (const [key, value] of Object.entries(origin.headers)) {
@@ -909,4 +1086,22 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Mirror proxy running on port ${PORT}`);
   console.log(`Origin: ${ORIGIN_BASE}`);
   console.log(`Set MIRROR_HOST env to your mirror domain for URL rewriting`);
+
+  // Pre-warm: solve Vercel challenge at startup so first user request is fast
+  (async () => {
+    try {
+      console.log("[VERCEL] Pre-warming bypass cookie...");
+      const res = await fetchFromOriginRaw("/", "GET", {}, null, "");
+      const bodyStr = res.body.toString("utf-8");
+      const token = detectVercelChallenge(bodyStr);
+      if (token) {
+        await obtainVercelBypass(token);
+        console.log("[VERCEL] Pre-warm complete — bypass cookie cached");
+      } else {
+        console.log("[VERCEL] No firewall challenge detected on origin (good)");
+      }
+    } catch (err) {
+      console.log("[VERCEL] Pre-warm skipped:", err.message);
+    }
+  })();
 });
